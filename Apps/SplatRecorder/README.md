@@ -6,6 +6,7 @@ A macOS viewer and recorder for 3D Gaussian Splat files, built on the [MetalSpla
 
 - macOS 15+ (Sequoia)
 - Apple Silicon (Intel is not supported)
+- Clone the repo as `MetalSplatter/` (SwiftPM derives the package identity from the directory name)
 
 ## Running
 
@@ -91,6 +92,10 @@ Click a circle on the ViewCube (bottom-right corner) to snap to a preset view:
 | Record | Start video recording (opens save dialog) |
 
 ## Recording
+
+> **⚠ Work in progress:** The recording pipeline is not yet functional.
+> The UI and controls are in place, but frame capture is not wired up.
+> Contributions welcome — see `RecordingMTKView.tryCaptureFrame()`.
 
 1. Load a splat file.
 2. Click **Record** in the toolbar.
