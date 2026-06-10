@@ -1,0 +1,23 @@
+MetalSplatter
+=============
+
+This project is a fork of scier/MetalSplatter.
+  Source: https://github.com/scier/MetalSplatter
+  License: MIT
+  Original author: Sean Cier (scier)
+
+The original MetalSplatter library and this fork are released under the MIT License.
+See LICENSE for the full text.
+
+Third-party dependencies
+------------------------
+
+swift-argument-parser
+  Author: Apple Inc.
+  License: Apache License 2.0
+  Source: https://github.com/apple/swift-argument-parser
+
+spz-swift
+  Author: scier (Sean Cier)
+  License: MIT
+  Source: https://github.com/scier/spz-swift

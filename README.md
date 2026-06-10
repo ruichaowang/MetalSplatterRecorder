@@ -1,3 +1,5 @@
+> **Fork note:** This is a fork of [scier/MetalSplatter](https://github.com/scier/MetalSplatter). This fork adds the **SplatRecorder** macOS viewer/recorder app -- see [`Apps/SplatRecorder/README.md`](Apps/SplatRecorder/README.md) for documentation.
+
 # MetalSplatter
 Render 3D Gaussian Splats using Metal on Apple platforms (iOS/iPhone/iPad, macOS, and visionOS/Vision Pro)
 
