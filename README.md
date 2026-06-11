@@ -1,4 +1,6 @@
-> **Fork note:** This is a fork of [scier/MetalSplatter](https://github.com/scier/MetalSplatter). This fork adds the **SplatRecorder** macOS viewer/recorder app -- see [`Apps/SplatRecorder/README.md`](Apps/SplatRecorder/README.md) for documentation.
+> **Fork note:** This is a fork of [scier/MetalSplatter](https://github.com/scier/MetalSplatter). This fork adds the **SplatRecorder** macOS viewer/recorder app — see [`Apps/SplatRecorder/README.md`](Apps/SplatRecorder/README.md) for documentation.
+>
+> **Remotes:** `origin` = [ruichaowang/MetalSplatterRecorder](https://github.com/ruichaowang/MetalSplatterRecorder) (this fork) · `upstream` = [scier/MetalSplatter](https://github.com/scier/MetalSplatter) (upstream). To sync with upstream: `git fetch upstream && git merge upstream/main`.
 
 # MetalSplatter
 Render 3D Gaussian Splats using Metal on Apple platforms (iOS/iPhone/iPad, macOS, and visionOS/Vision Pro)
