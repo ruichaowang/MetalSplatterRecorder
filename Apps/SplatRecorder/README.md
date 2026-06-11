@@ -10,6 +10,12 @@ A macOS viewer and recorder for 3D Gaussian Splat files, built on the [MetalSpla
 
 ## Running
 
+All commands must be run from the `Apps/SplatRecorder` subdirectory — this is a standalone Swift package.
+
+```bash
+cd Apps/SplatRecorder
+```
+
 ### GUI mode
 
 Launch the app and open a file interactively:
