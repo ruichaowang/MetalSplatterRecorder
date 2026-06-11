@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  root-build-and-test:
+    name: Root — Build & Test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build root package
+        run: swift build
+
+      - name: Test root package
+        run: swift test
+
+  splatrecorder-build-and-test:
+    name: SplatRecorder — Build & Test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build SplatRecorder
+        working-directory: Apps/SplatRecorder
+        run: swift build --product SplatRecorder
+
+      - name: Test SplatRecorder
+        working-directory: Apps/SplatRecorder
+        run: swift test
+
+  clean-check:
+    name: Clean Checkout Verification
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify default.metallib exists
+        run: |
+          if [ ! -f MetalSplatter/Resources/default.metallib ]; then
+            echo "ERROR: default.metallib is missing — clean checkout will fail"
+            exit 1
+          fi
+          echo "✓ default.metallib present"
+
+      - name: Verify no stale root SplatRecorder target
+        run: |
+          if grep -q 'name: "SplatRecorder"' Package.swift; then
+            echo "ERROR: root Package.swift still declares SplatRecorder target"
+            exit 1
+          fi
+          echo "✓ No stale SplatRecorder target in root Package.swift"
+
+      - name: Build root (clean checkout simulation)
+        run: swift build
+
+      - name: Build SplatRecorder (clean checkout simulation)
+        working-directory: Apps/SplatRecorder
+        run: swift build --product SplatRecorder
