@@ -321,15 +321,29 @@ struct SplatRecorderContentView: View {
             guard response == .OK, let url = savePanel.url else { return }
 
             Task { @MainActor in
+                // Validate pre-conditions
+                guard splatDocument.loadState == .loaded else {
+                    print("Cannot start recording: no splat loaded")
+                    return
+                }
+                guard let view = recordingView else {
+                    print("Cannot start recording: MTKView not available")
+                    return
+                }
+                let rawSize = view.drawableSize
+                guard rawSize.width > 0, rawSize.height > 0 else {
+                    print("Cannot start recording: invalid drawable size \(rawSize)")
+                    return
+                }
+
                 do {
-                    let size = recordingView?.drawableSize ?? CGSize(width: 1920, height: 1080)
-                    try videoRecorder.start(url: url, size: size, device: metalDevice)
+                    try videoRecorder.start(url: url, size: rawSize, device: metalDevice)
 
                     // Lock window size
                     NSApp.mainWindow?.styleMask.remove(.resizable)
 
                     // Sync recording state to MTKView
-                    recordingView?.setRecording(true)
+                    view.setRecording(true)
 
                     isRecording = true
                     recordingElapsed = 0
@@ -340,7 +354,7 @@ struct SplatRecorderContentView: View {
                         }
                     }
                 } catch {
-                    print("Failed to start recording: \(error)")
+                    print("Failed to start recording: \(error.localizedDescription)")
                 }
             }
         }
@@ -352,12 +366,32 @@ struct SplatRecorderContentView: View {
 
         recordingView?.setRecording(false)
 
-        Task {
-            try videoRecorder.stop()
+        // Stop on a background thread (stop() is synchronous and blocks)
+        DispatchQueue.global().async {
+            do {
+                try self.videoRecorder.stop()
 
-            await MainActor.run {
-                isRecording = false
-                NSApp.mainWindow?.styleMask.insert(.resizable)
+                let encoded = self.videoRecorder.encodedFrameCount
+                let dropped = self.videoRecorder.droppedFrameCount
+                let outputPath = self.videoRecorder.outputURL?.path ?? "unknown"
+
+                print("Recording saved: \(outputPath)")
+                print("  Encoded: \(encoded) frames, Dropped: \(dropped) frames")
+
+                if let error = self.videoRecorder.lastError {
+                    print("  Warning: \(error.localizedDescription)")
+                }
+
+                DispatchQueue.main.async {
+                    self.isRecording = false
+                    NSApp.mainWindow?.styleMask.insert(.resizable)
+                }
+            } catch {
+                print("Failed to stop recording: \(error.localizedDescription)")
+                DispatchQueue.main.async {
+                    self.isRecording = false
+                    NSApp.mainWindow?.styleMask.insert(.resizable)
+                }
             }
         }
     }
