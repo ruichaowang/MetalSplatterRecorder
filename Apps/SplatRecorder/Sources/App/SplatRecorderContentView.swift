@@ -323,7 +323,7 @@ struct SplatRecorderContentView: View {
             Task { @MainActor in
                 do {
                     let size = recordingView?.drawableSize ?? CGSize(width: 1920, height: 1080)
-                    try await videoRecorder.start(url: url, size: size, device: metalDevice)
+                    try videoRecorder.start(url: url, size: size, device: metalDevice)
 
                     // Lock window size
                     NSApp.mainWindow?.styleMask.remove(.resizable)
@@ -353,7 +353,7 @@ struct SplatRecorderContentView: View {
         recordingView?.setRecording(false)
 
         Task {
-            await videoRecorder.stop()
+            try videoRecorder.stop()
 
             await MainActor.run {
                 isRecording = false

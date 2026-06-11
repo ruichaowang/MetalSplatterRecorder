@@ -3,192 +3,304 @@ import Foundation
 import CoreMedia
 @preconcurrency import CoreVideo
 import Metal
+import Synchronization
 
 /// A single captured frame ready for encoding.
+/// Retains CVMetalTexture to prevent the underlying CVPixelBuffer
+/// from being recycled before GPU operations complete.
 struct RecordingFrame: @unchecked Sendable {
+    let cvTexture: CVMetalTexture
     let texture: MTLTexture
     let pixelBuffer: CVPixelBuffer
     let presentationTime: CMTime
 }
 
-/// Actor-based video recorder using AVAssetWriter for H.264 MP4 output.
-/// Uses Scheme B: renders once to a recording texture, then blits to drawable.
-actor VideoRecorder: @unchecked Sendable {
-    private(set) var isRecording = false
+/// Mutex-based video recorder using AVAssetWriter for H.264 MP4 output.
+/// Synchronous capture API — callable from @MainActor draw loop and GPU completion handlers.
+final class VideoRecorder: @unchecked Sendable {
 
-    private var assetWriter: AVAssetWriter?
-    private var assetWriterInput: AVAssetWriterInput?
-    private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
-    private var pixelBufferPool: CVPixelBufferPool?
-    private var textureCache: CVMetalTextureCache?
+    struct State {
+        var isRecording = false
+        var encodedFrameCount = 0
+        var droppedFrameCount = 0
+        var inflightFrameCount = 0
+        var lastError: VideoRecorderError?
 
-    private var outputURL: URL?
-    private var videoSize: CGSize = .zero
-    private var targetFPS: Int = 30
-    private var lastCaptureTime: CMTime = .invalid
+        var assetWriter: AVAssetWriter?
+        var assetWriterInput: AVAssetWriterInput?
+        var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+        var pixelBufferPool: CVPixelBufferPool?
+        var textureCache: CVMetalTextureCache?
 
-    // MARK: - Public API
-
-    func start(url: URL, size: CGSize, device: MTLDevice, fps: Int = 30) throws {
-        guard !isRecording else { return }
-
-        self.outputURL = url
-        self.videoSize = size
-        self.targetFPS = fps
-        self.lastCaptureTime = .invalid
-
-        // Remove existing file if any
-        try? FileManager.default.removeItem(at: url)
-
-        // Create AVAssetWriter
-        assetWriter = try AVAssetWriter(outputURL: url, fileType: .mp4)
-
-        // H.264 video settings
-        let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: Int(size.width),
-            AVVideoHeightKey: Int(size.height),
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: Int(size.width * size.height * 10),
-                AVVideoMaxKeyFrameIntervalKey: 30,
-            ]
-        ]
-
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        input.expectsMediaDataInRealTime = true
-        assetWriterInput = input
-
-        // Pixel buffer adaptor attributes
-        let sourcePixelBufferAttributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: Int(size.width),
-            kCVPixelBufferHeightKey as String: Int(size.height),
-            kCVPixelBufferMetalCompatibilityKey as String: true,
-        ]
-        pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: input,
-            sourcePixelBufferAttributes: sourcePixelBufferAttributes
-        )
-
-        // Create pixel buffer pool (capacity 3)
-        var pool: CVPixelBufferPool?
-        let poolAttributes: [String: Any] = [
-            kCVPixelBufferPoolMinimumBufferCountKey as String: 3,
-        ]
-        CVPixelBufferPoolCreate(nil, poolAttributes as CFDictionary,
-                                sourcePixelBufferAttributes as CFDictionary, &pool)
-        pixelBufferPool = pool
-
-        // Create Metal texture cache
-        var cache: CVMetalTextureCache?
-        CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
-        textureCache = cache
-
-        guard let writer = assetWriter, writer.canAdd(input) else {
-            throw VideoRecorderError.cannotAddInput
-        }
-        writer.add(input)
-        writer.startWriting()
-        writer.startSession(atSourceTime: .zero)
-
-        isRecording = true
+        var outputURL: URL?
+        var videoSize: CGSize = .zero
+        var targetFPS: Int = 30
+        var startHostTime: CMTime = .invalid
+        var lastFrameHostTime: CMTime = .invalid
     }
 
-    /// Creates a pixel-buffer-backed Metal texture for recording a frame.
-    /// Returns nil if: not recording, frame interval too short, or pool exhausted.
-    /// Note: This is the actor-isolated version. Task 12 will add a @MainActor synchronous version.
-    func makeFrameTexture(
-        commandBuffer: MTLCommandBuffer,
-        presentationTime: CMTime
-    ) -> RecordingFrame? {
-        guard isRecording, let pool = pixelBufferPool, let cache = textureCache else {
-            return nil
-        }
+    private let state = Mutex(State())
 
-        // Frame rate throttling
-        if lastCaptureTime.isValid {
-            let targetInterval = CMTime(value: 1, timescale: Int32(targetFPS))
-            if CMTimeSubtract(presentationTime, lastCaptureTime) < targetInterval {
+    // MARK: - Read-Only Stats
+
+    var isRecording: Bool { state.withLock { $0.isRecording } }
+    var encodedFrameCount: Int { state.withLock { $0.encodedFrameCount } }
+    var droppedFrameCount: Int { state.withLock { $0.droppedFrameCount } }
+    var outputURL: URL? { state.withLock { $0.outputURL } }
+    var lastError: VideoRecorderError? { state.withLock { $0.lastError } }
+
+    // MARK: - Lifecycle
+
+    /// Start recording. Size is rounded down to even dimensions for H.264.
+    func start(url: URL, size: CGSize, device: MTLDevice, fps: Int = 30) throws {
+        try state.withLock { s in
+            guard !s.isRecording else { return }
+
+            // Round to even dimensions (H.264 requirement)
+            let evenWidth = Int(size.width) & ~1
+            let evenHeight = Int(size.height) & ~1
+            let evenSize = CGSize(width: evenWidth, height: evenHeight)
+
+            s.outputURL = url
+            s.videoSize = evenSize
+            s.targetFPS = fps
+            s.startHostTime = CMClockGetTime(CMClockGetHostTimeClock())
+            s.lastFrameHostTime = .invalid
+            s.encodedFrameCount = 0
+            s.droppedFrameCount = 0
+            s.inflightFrameCount = 0
+            s.lastError = nil
+
+            // Remove existing file if any
+            try? FileManager.default.removeItem(at: url)
+
+            // Create AVAssetWriter
+            let writer: AVAssetWriter
+            do {
+                writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+            } catch {
+                throw VideoRecorderError.cannotCreateWriter(error)
+            }
+            s.assetWriter = writer
+
+            // H.264 video settings
+            let videoSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: evenWidth,
+                AVVideoHeightKey: evenHeight,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: Int(evenWidth * evenHeight * 10),
+                    AVVideoMaxKeyFrameIntervalKey: 30,
+                ]
+            ]
+
+            let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            input.expectsMediaDataInRealTime = true
+            s.assetWriterInput = input
+
+            // Pixel buffer adaptor attributes
+            let sourcePixelBufferAttributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: evenWidth,
+                kCVPixelBufferHeightKey as String: evenHeight,
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+            s.pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: input,
+                sourcePixelBufferAttributes: sourcePixelBufferAttributes
+            )
+
+            // Create pixel buffer pool (capacity 3)
+            var pool: CVPixelBufferPool?
+            let poolAttributes: [String: Any] = [
+                kCVPixelBufferPoolMinimumBufferCountKey as String: 3,
+            ]
+            CVPixelBufferPoolCreate(nil, poolAttributes as CFDictionary,
+                                    sourcePixelBufferAttributes as CFDictionary, &pool)
+            s.pixelBufferPool = pool
+
+            // Create Metal texture cache
+            var cache: CVMetalTextureCache?
+            CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
+            s.textureCache = cache
+
+            guard writer.canAdd(input) else {
+                throw VideoRecorderError.cannotAddInput
+            }
+            writer.add(input)
+            writer.startWriting()
+            writer.startSession(atSourceTime: .zero)
+
+            s.isRecording = true
+        }
+    }
+
+    // MARK: - Per-Frame Capture
+
+    /// Create a pixel-buffer-backed Metal texture for the current frame.
+    /// Handles fps throttling internally. Returns nil if the frame should be skipped.
+    func makeFrameTexture(hostTime: CMTime) -> RecordingFrame? {
+        state.withLock { s in
+            guard s.isRecording else { return nil }
+
+            // Frame rate throttling (with epsilon for CMTime precision)
+            if s.lastFrameHostTime.isValid {
+                let diffSeconds = CMTimeGetSeconds(CMTimeSubtract(hostTime, s.lastFrameHostTime))
+                let intervalSeconds = 1.0 / Double(s.targetFPS)
+                if diffSeconds < intervalSeconds - 0.0001 {
+                    s.droppedFrameCount += 1
+                    return nil
+                }
+            }
+
+            // Calculate relative presentation time
+            let presentationTime = CMTimeSubtract(hostTime, s.startHostTime)
+
+            // Get pixel buffer from pool
+            guard let pool = s.pixelBufferPool else { return nil }
+            var pixelBuffer: CVPixelBuffer?
+            let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBuffer)
+            guard status == kCVReturnSuccess, let pb = pixelBuffer else {
+                s.droppedFrameCount += 1
                 return nil
             }
-        }
 
-        // Get pixel buffer from pool
-        var pixelBuffer: CVPixelBuffer?
-        let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBuffer)
-        guard status == kCVReturnSuccess, let pb = pixelBuffer else {
-            return nil
-        }
+            // Create Metal texture from pixel buffer
+            guard let cache = s.textureCache else {
+                s.droppedFrameCount += 1
+                return nil
+            }
+            var cvTexture: CVMetalTexture?
+            CVMetalTextureCacheCreateTextureFromImage(
+                nil, cache, pb, nil, .bgra8Unorm,
+                Int(s.videoSize.width), Int(s.videoSize.height), 0, &cvTexture
+            )
+            guard let cvTex = cvTexture, let texture = CVMetalTextureGetTexture(cvTex) else {
+                s.droppedFrameCount += 1
+                return nil
+            }
 
-        // Create Metal texture from pixel buffer
-        var cvTexture: CVMetalTexture?
-        CVMetalTextureCacheCreateTextureFromImage(
-            nil, cache, pb, nil, .bgra8Unorm,
-            Int(videoSize.width), Int(videoSize.height), 0, &cvTexture
-        )
-        guard let cvTex = cvTexture, let texture = CVMetalTextureGetTexture(cvTex) else {
-            return nil
-        }
+            s.lastFrameHostTime = hostTime
+            s.inflightFrameCount += 1
 
-        lastCaptureTime = presentationTime
-        return RecordingFrame(texture: texture, pixelBuffer: pb, presentationTime: presentationTime)
+            return RecordingFrame(
+                cvTexture: cvTex,
+                texture: texture,
+                pixelBuffer: pb,
+                presentationTime: presentationTime
+            )
+        }
     }
 
-    /// Submit a captured frame for encoding.
-    nonisolated func finishFrame(_ frame: RecordingFrame) {
-        let captured = self
-        Task { await captured._finishFrame(frame) }
-    }
+    /// Submit a captured frame for encoding. Safe to call from any thread.
+    func finishFrame(_ frame: RecordingFrame) {
+        // Extract adaptor ref under lock, then call append outside lock
+        // to avoid task-isolation conflict with @MainActor-isolated API.
+        let adaptor: AVAssetWriterInputPixelBufferAdaptor?
+        adaptor = state.withLock { s -> AVAssetWriterInputPixelBufferAdaptor? in
+            defer { s.inflightFrameCount -= 1 }
+            guard s.isRecording else { return nil }
+            guard let inp = s.assetWriterInput, inp.isReadyForMoreMediaData else {
+                s.droppedFrameCount += 1
+                return nil
+            }
+            return s.pixelBufferAdaptor
+        }
 
-    private func _finishFrame(_ frame: RecordingFrame) {
-        guard isRecording else { return }
-        guard let input = assetWriterInput, input.isReadyForMoreMediaData else { return }
-        guard let adaptor = pixelBufferAdaptor else { return }
-        adaptor.append(frame.pixelBuffer, withPresentationTime: frame.presentationTime)
-    }
+        guard let adaptor else { return }
 
-    /// Normal stop: finalize the MP4 file.
-    func stop() async {
-        guard isRecording else { return }
-        isRecording = false
-
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            assetWriterInput?.markAsFinished()
-            assetWriter?.finishWriting {
-                continuation.resume()
+        let success = adaptor.append(frame.pixelBuffer, withPresentationTime: frame.presentationTime)
+        state.withLock { s in
+            if success {
+                s.encodedFrameCount += 1
+            } else {
+                s.droppedFrameCount += 1
             }
         }
-
-        teardown()
     }
 
-    /// Cancel: discard the recording.
-    func cancel() async {
-        guard isRecording else { return }
-        isRecording = false
+    // MARK: - Stop / Cancel
 
-        assetWriter?.cancelWriting()
-        // Clean up partial file
-        if let url = outputURL {
-            try? FileManager.default.removeItem(at: url)
+    /// Stop recording and finalize the MP4. Blocks until all inflight frames
+    /// are drained and the writer finishes.
+    func stop() throws {
+        // 1. Mark stopped — prevents new frames
+        state.withLock { $0.isRecording = false }
+
+        // 2. Drain inflight frames (with 5s timeout)
+        let deadline = DispatchTime.now() + .seconds(5)
+        while state.withLock({ $0.inflightFrameCount > 0 }) {
+            if DispatchTime.now() > deadline {
+                throw VideoRecorderError.stopTimeout
+            }
+            Thread.sleep(forTimeInterval: 0.01)
         }
 
+        // 3. Finalize writer (extract refs from lock first)
+        let (writer, input) = state.withLock { s -> (AVAssetWriter?, AVAssetWriterInput?) in
+            return (s.assetWriter, s.assetWriterInput)
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        input?.markAsFinished()
+        writer?.finishWriting {
+            semaphore.signal()
+        }
+        semaphore.wait()
+
+        teardown()
+
+        if let error = writer?.error {
+            throw VideoRecorderError.finishWritingFailed(error)
+        }
+    }
+
+    /// Cancel recording, discarding the output file.
+    func cancel() {
+        state.withLock { $0.isRecording = false }
+        // Don't wait for inflight frames — we're throwing away the output.
+
+        if let url = state.withLock({ $0.outputURL }) {
+            try? FileManager.default.removeItem(at: url)
+        }
+        state.withLock { s in s.assetWriter?.cancelWriting() }
         teardown()
     }
 
     // MARK: - Private
 
     private func teardown() {
-        assetWriter = nil
-        assetWriterInput = nil
-        pixelBufferAdaptor = nil
-        pixelBufferPool = nil
-        textureCache = nil
-        outputURL = nil
-        lastCaptureTime = .invalid
+        state.withLock { s in
+            s.assetWriter = nil
+            s.assetWriterInput = nil
+            s.pixelBufferAdaptor = nil
+            s.pixelBufferPool = nil
+            s.textureCache = nil
+            s.outputURL = nil
+            s.lastFrameHostTime = .invalid
+            s.startHostTime = .invalid
+        }
     }
 }
 
-enum VideoRecorderError: Error {
+// MARK: - Errors
+
+enum VideoRecorderError: Error, LocalizedError {
+    case cannotCreateWriter(Error)
     case cannotAddInput
+    case stopTimeout
+    case finishWritingFailed(Error)
+
+    var errorDescription: String? {
+        switch self {
+        case .cannotCreateWriter(let error):
+            "Unable to create AVAssetWriter: \(error.localizedDescription)"
+        case .cannotAddInput:
+            "Unable to add video input to AVAssetWriter"
+        case .stopTimeout:
+            "Timed out waiting for inflight frames to complete"
+        case .finishWritingFailed(let error):
+            "AVAssetWriter failed to finish writing: \(error.localizedDescription)"
+        }
+    }
 }
