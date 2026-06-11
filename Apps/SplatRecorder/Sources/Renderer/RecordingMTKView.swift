@@ -51,7 +51,6 @@ final class RecordingMTKView: MTKView, MTKViewDelegate {
 
     /// Set by the UI layer when recording starts/stops.
     @MainActor var isRecording = false
-    @MainActor private var lastCaptureTime: CMTime = .invalid
     @MainActor private var intermediateTexture: MTLTexture?
 
     // MARK: - Init
@@ -297,9 +296,9 @@ final class RecordingMTKView: MTKView, MTKViewDelegate {
 
         let now = CMClockGetTime(CMClockGetHostTimeClock())
 
-        if isRecording, shouldCaptureFrame(now) {
+        if isRecording {
             // === RECORDING FRAME PATH (Scheme B) ===
-            guard let frame = tryCaptureFrame(commandBuffer: commandBuffer, presentationTime: now) else {
+            guard let frame = tryCaptureFrame(presentationTime: now) else {
                 // Throttled or pool exhausted — render normally this frame
                 renderNormally(renderer: renderer, to: drawable.texture,
                                commandBuffer: commandBuffer, drawable: drawable)
@@ -353,7 +352,24 @@ final class RecordingMTKView: MTKView, MTKViewDelegate {
                 blitEncoder.endEncoding()
             }
 
-            // Step 3: Submit frame for encoding after GPU completes
+            // Step 3: Blit intermediate → frame texture (recording)
+            if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
+                let frameTargetSize = MTLSize(width: frame.texture.width, height: frame.texture.height, depth: 1)
+                blitEncoder.copy(
+                    from: midTex, sourceSlice: 0, sourceLevel: 0,
+                    sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                    sourceSize: MTLSize(
+                        width: min(targetSize.width, frameTargetSize.width),
+                        height: min(targetSize.height, frameTargetSize.height),
+                        depth: 1
+                    ),
+                    to: frame.texture, destinationSlice: 0,
+                    destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+                )
+                blitEncoder.endEncoding()
+            }
+
+            // Submit frame for encoding after GPU completes
             // Capture recorder outside the closure to avoid @MainActor access from GPU callback.
             let recorder = videoRecorder
             commandBuffer.addCompletedHandler { _ in
@@ -363,8 +379,6 @@ final class RecordingMTKView: MTKView, MTKViewDelegate {
 
             commandBuffer.present(drawable)
             commandBuffer.commit()
-
-            lastCaptureTime = now
         } else {
             // === NORMAL FRAME PATH ===
             renderNormally(renderer: renderer, to: drawable.texture,
@@ -415,32 +429,15 @@ final class RecordingMTKView: MTKView, MTKViewDelegate {
     }
 
     @MainActor
-    private func shouldCaptureFrame(_ now: CMTime) -> Bool {
-        let targetInterval = CMTime(value: 1, timescale: 30)
-        if !lastCaptureTime.isValid { return true }
-        return CMTimeSubtract(now, lastCaptureTime) >= targetInterval
+    private func tryCaptureFrame(presentationTime: CMTime) -> RecordingFrame? {
+        return videoRecorder?.makeFrameTexture(hostTime: presentationTime)
     }
 
-    @MainActor
-    private func tryCaptureFrame(commandBuffer: MTLCommandBuffer,
-                                  presentationTime: CMTime) -> RecordingFrame? {
-        // Use the local pixel buffer logic directly since we're on @MainActor
-        // and need synchronous access to the pool.
-        // This is a simplified version — the real pixel buffer management will
-        // be refined in VideoRecorder's @MainActor tryCapture() method.
-
-        // For now, return nil to let the normal path handle rendering.
-        // The recording pipeline is structurally complete; pixel buffer capture
-        // will be wired up when VideoRecorder's @MainActor API is finalized.
-        return nil
-    }
-
-    /// Update recording state from the VideoRecorder actor.
+    /// Update recording state from the VideoRecorder.
     @MainActor
     func setRecording(_ recording: Bool) {
         isRecording = recording
         if recording {
-            lastCaptureTime = .invalid
             intermediateTexture = nil
         }
     }
