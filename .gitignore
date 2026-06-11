@@ -5,3 +5,10 @@ DerivedData/
 .build
 Package.resolved
 
+.superpowers/
+.claude/
+.codex/
+docs/
+
+# Temporary plan files
+PLAN*.md
