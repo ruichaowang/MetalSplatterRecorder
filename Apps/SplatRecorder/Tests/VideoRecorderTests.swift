@@ -26,7 +26,7 @@ final class VideoRecorderTests: XCTestCase {
 
     // MARK: - Lifecycle
 
-    func testStartStopProducesNonEmptyMP4() throws {
+    func testStartStopProducesNonEmptyMP4() async throws {
         let recorder = VideoRecorder()
         let size = CGSize(width: 640, height: 480)
         try recorder.start(url: outputURL, size: size, device: device, fps: 30)
@@ -43,7 +43,9 @@ final class VideoRecorderTests: XCTestCase {
             recorder.finishFrame(frame)
         }
 
-        try recorder.stop()
+        let summary = try recorder.stop()
+        XCTAssertNotNil(summary, "Should return a summary for active recording")
+        XCTAssertEqual(summary?.encodedFrameCount, 5)
 
         // Verify output
         XCTAssertTrue(FileManager.default.fileExists(atPath: outputURL.path))
@@ -51,12 +53,14 @@ final class VideoRecorderTests: XCTestCase {
         let fileSize = (attrs[.size] as? Int64) ?? 0
         XCTAssertGreaterThan(fileSize, 1000, "MP4 should be > 1000 bytes")
 
-        let asset = AVAsset(url: outputURL)
-        XCTAssertTrue(asset.tracks(withMediaType: .video).count > 0, "Should have a video track")
-        let videoTrack = asset.tracks(withMediaType: .video).first!
-        XCTAssertEqual(videoTrack.naturalSize.width, 640)
-        XCTAssertEqual(videoTrack.naturalSize.height, 480)
-        XCTAssertGreaterThan(asset.duration.seconds, 0, "Duration should be > 0")
+        let asset = AVURLAsset(url: outputURL)
+        let videoTrack = try await asset.loadTracks(withMediaType: .video).first
+        let naturalSize = try await videoTrack?.load(.naturalSize) ?? .zero
+        let duration = try await asset.load(.duration).seconds
+        XCTAssertNotNil(videoTrack, "Should have a video track")
+        XCTAssertEqual(naturalSize.width, 640)
+        XCTAssertEqual(naturalSize.height, 480)
+        XCTAssertGreaterThan(duration, 0, "Duration should be > 0")
     }
 
     // MARK: - Throttle
@@ -91,7 +95,7 @@ final class VideoRecorderTests: XCTestCase {
         // Verify dropped count
         XCTAssertEqual(recorder.droppedFrameCount, 2, "Should have 2 dropped frames from throttle")
 
-        try recorder.stop()
+        _ = try recorder.stop()
     }
 
     // MARK: - Size Even Rounding
@@ -113,7 +117,7 @@ final class VideoRecorderTests: XCTestCase {
             recorder.finishFrame(f)
         }
 
-        try recorder.stop()
+        _ = try recorder.stop()
     }
 
     // MARK: - Inflight Drain
@@ -125,30 +129,31 @@ final class VideoRecorderTests: XCTestCase {
         let hostClock = CMClockGetHostTimeClock()
         let t0 = CMClockGetTime(hostClock)
 
-        // Create 3 inflight frames
-        for i in 0..<3 {
+        // Create 3 inflight frames, then finish them from another thread
+        let frames: [RecordingFrame] = (0..<3).compactMap { i in
             let ft = CMTimeAdd(t0, CMTime(value: Int64(i), timescale: 30))
-            guard let frame = recorder.makeFrameTexture(hostTime: ft) else {
-                XCTFail("Frame \(i) should not be nil")
-                return
+            return recorder.makeFrameTexture(hostTime: ft)
+        }
+        XCTAssertEqual(frames.count, 3, "All 3 frames should be created")
+
+        // Finish frames from a background queue while stop() is called
+        let expectation = self.expectation(description: "All frames finished")
+        let queue = DispatchQueue(label: "test-finish-queue", attributes: .concurrent)
+        queue.async {
+            // Small delay to simulate GPU completion timing
+            Thread.sleep(forTimeInterval: 0.1)
+            for frame in frames {
+                recorder.finishFrame(frame)
             }
-            // Don't finishFrame — they stay inflight
-            _ = frame // keep alive
+            expectation.fulfill()
         }
 
-        // stop should drain (finishFrame was never called, so inflightCount=3)
-        // The frames above will be released when they go out of scope,
-        // but we test that stop handles the case where inflight frames exist.
-        // In this test, the frames are "lost" (never finished), so stop will
-        // time out after 5s. That's expected — we just verify it doesn't crash.
-        // Real scenario: GPU completion handler calls finishFrame before timeout.
-        do {
-            try recorder.stop()
-            // If we reach here, the timeout didn't fire (frames were released quickly)
-        } catch {
-            // Timeout is acceptable for this test — frames were never finished
-            XCTAssertTrue(error is VideoRecorderError)
-        }
+        // stop() should wait for inflight frames to be drained
+        let summary = try recorder.stop()
+        XCTAssertNotNil(summary, "Should return summary")
+        XCTAssertEqual(summary?.encodedFrameCount, 3, "All 3 frames should be encoded")
+
+        wait(for: [expectation], timeout: 1.0)
     }
 
     // MARK: - RecordingFrame retains CVMetalTexture
@@ -174,6 +179,74 @@ final class VideoRecorderTests: XCTestCase {
         XCTAssertEqual(tex?.height, 480)
 
         recorder.finishFrame(frame)
-        try recorder.stop()
+        _ = try recorder.stop()
+    }
+
+    // MARK: - Stop Idle / Idempotent
+
+    func testStopReturnsImmediatelyWhenIdle() throws {
+        let recorder = VideoRecorder()
+
+        let start = DispatchTime.now()
+        let summary = try recorder.stop()
+        let elapsed = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
+
+        XCTAssertNil(summary, "Should return nil when no recording was started")
+        XCTAssertLessThan(elapsed, 1_000_000_000, "Should return in < 1 second") // 1s in ns
+    }
+
+    func testStopReturnsImmediatelyWhenAlreadyStopped() throws {
+        let recorder = VideoRecorder()
+        try recorder.start(url: outputURL, size: CGSize(width: 640, height: 480), device: device, fps: 30)
+
+        let hostClock = CMClockGetHostTimeClock()
+        let t0 = CMClockGetTime(hostClock)
+        guard let frame = recorder.makeFrameTexture(hostTime: t0) else {
+            XCTFail("Should get a frame")
+            return
+        }
+        recorder.finishFrame(frame)
+
+        // First stop — should succeed with summary
+        let summary1 = try recorder.stop()
+        XCTAssertNotNil(summary1, "First stop should return summary")
+
+        // Second stop — should return nil immediately (idempotent)
+        let start = DispatchTime.now()
+        let summary2 = try recorder.stop()
+        let elapsed = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
+
+        XCTAssertNil(summary2, "Second stop should return nil")
+        XCTAssertLessThan(elapsed, 1_000_000_000, "Second stop should return in < 1 second")
+    }
+
+    // MARK: - Discard Frame
+
+    func testDiscardFrameReleasesInflightSoStopDoesNotTimeout() throws {
+        let recorder = VideoRecorder()
+        try recorder.start(url: outputURL, size: CGSize(width: 640, height: 480), device: device, fps: 30)
+
+        let hostClock = CMClockGetHostTimeClock()
+        let t0 = CMClockGetTime(hostClock)
+
+        // Create 3 frames but discard them all (simulating render failures)
+        for i in 0..<3 {
+            let ft = CMTimeAdd(t0, CMTime(value: Int64(i), timescale: 30))
+            guard let frame = recorder.makeFrameTexture(hostTime: ft) else {
+                XCTFail("Frame \(i) should not be nil")
+                return
+            }
+            recorder.discardFrame(frame)
+        }
+
+        // stop() should complete quickly since all inflight frames were discarded
+        let start = DispatchTime.now()
+        let summary = try recorder.stop()
+        let elapsed = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
+
+        XCTAssertNotNil(summary, "Should return summary")
+        XCTAssertEqual(summary?.encodedFrameCount, 0, "No frames should be encoded")
+        XCTAssertEqual(summary?.droppedFrameCount, 3, "All 3 frames should be dropped")
+        XCTAssertLessThan(elapsed, 3_000_000_000, "Should complete in < 3 seconds") // 3s in ns
     }
 }

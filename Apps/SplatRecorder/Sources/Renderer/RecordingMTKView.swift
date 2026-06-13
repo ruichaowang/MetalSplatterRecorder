@@ -322,21 +322,31 @@ final class RecordingMTKView: MTKView, MTKViewDelegate {
             }
 
             guard let midTex = intermediateTexture else {
+                // Intermediate texture creation failed — abandon this frame
+                videoRecorder?.discardFrame(frame)
                 renderNormally(renderer: renderer, to: drawable.texture,
                                commandBuffer: commandBuffer, drawable: drawable)
                 return
             }
 
             // Step 1: Render to intermediate texture
+            let didRender: Bool
             do {
-                let didRender = try renderer.render(
+                didRender = try renderer.render(
                     to: midTex,
                     depthTexture: depthStencilTexture,
                     commandBuffer: commandBuffer
                 )
-                guard didRender else { commandBuffer.commit(); return }
             } catch {
                 print("Recording render error: \(error)")
+                videoRecorder?.discardFrame(frame)
+                commandBuffer.commit()
+                return
+            }
+
+            guard didRender else {
+                // Render skipped — abandon this frame
+                videoRecorder?.discardFrame(frame)
                 commandBuffer.commit()
                 return
             }
@@ -353,6 +363,7 @@ final class RecordingMTKView: MTKView, MTKViewDelegate {
             }
 
             // Step 3: Blit intermediate → frame texture (recording)
+            var recordingBlitSucceeded = false
             if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
                 let frameTargetSize = MTLSize(width: frame.texture.width, height: frame.texture.height, depth: 1)
                 blitEncoder.copy(
@@ -367,14 +378,20 @@ final class RecordingMTKView: MTKView, MTKViewDelegate {
                     destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
                 )
                 blitEncoder.endEncoding()
+                recordingBlitSucceeded = true
             }
 
-            // Submit frame for encoding after GPU completes
-            // Capture recorder outside the closure to avoid @MainActor access from GPU callback.
-            let recorder = videoRecorder
-            commandBuffer.addCompletedHandler { _ in
-                // finishFrame is nonisolated — safe from completion handler
-                recorder?.finishFrame(frame)
+            if recordingBlitSucceeded {
+                // Submit frame for encoding after GPU completes
+                // Capture recorder outside the closure to avoid @MainActor access from GPU callback.
+                let recorder = videoRecorder
+                commandBuffer.addCompletedHandler { _ in
+                    // finishFrame is nonisolated — safe from completion handler
+                    recorder?.finishFrame(frame)
+                }
+            } else {
+                // Recording blit failed — abandon this frame
+                videoRecorder?.discardFrame(frame)
             }
 
             commandBuffer.present(drawable)

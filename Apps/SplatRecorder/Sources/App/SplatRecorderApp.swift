@@ -11,6 +11,9 @@ enum SplatRecorderApp {
         if runAxisDebugIfRequested() {
             return
         }
+        if runRecordingValidationIfRequested() {
+            return
+        }
         if runValidationIfRequested() {
             return
         }
@@ -65,6 +68,41 @@ enum SplatRecorderApp {
             exit(1)
         case .none:
             fputs("SplatRecorder axis debug failed without an error\n", stderr)
+            exit(1)
+        }
+    }
+
+    private static func runRecordingValidationIfRequested() -> Bool {
+        let args = CommandLine.arguments
+        guard args.dropFirst().first == "--validate-recording" else { return false }
+        guard args.count >= 3 else {
+            fputs("Usage: SplatRecorder --validate-recording <output-dir>\n", stderr)
+            exit(2)
+        }
+
+        let outputDirectory = URL(fileURLWithPath: args[2], isDirectory: true)
+        let completion = DispatchSemaphore(value: 0)
+        let box = ValidationResultBox()
+
+        Task.detached {
+            do {
+                try await SplatRecorderRecordingValidation.run(outputDirectory: outputDirectory)
+                box.result = .success(())
+            } catch {
+                box.result = .failure(error)
+            }
+            completion.signal()
+        }
+
+        completion.wait()
+        switch box.result {
+        case .success:
+            return true
+        case .failure(let error):
+            fputs("SplatRecorder recording validation failed: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        case .none:
+            fputs("SplatRecorder recording validation failed without an error\n", stderr)
             exit(1)
         }
     }

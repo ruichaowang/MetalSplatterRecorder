@@ -366,20 +366,24 @@ struct SplatRecorderContentView: View {
 
         recordingView?.setRecording(false)
 
+        // Capture recorder ref outside closure to avoid @MainActor isolation warning
+        let recorder = videoRecorder
+
         // Stop on a background thread (stop() is synchronous and blocks)
         DispatchQueue.global().async {
             do {
-                try self.videoRecorder.stop()
+                let summary = try recorder.stop()
 
-                let encoded = self.videoRecorder.encodedFrameCount
-                let dropped = self.videoRecorder.droppedFrameCount
-                let outputPath = self.videoRecorder.outputURL?.path ?? "unknown"
+                if let summary {
+                    let outputPath = summary.outputURL?.path ?? "unknown"
+                    print("Recording saved: \(outputPath)")
+                    print("  Encoded: \(summary.encodedFrameCount) frames, Dropped: \(summary.droppedFrameCount) frames")
 
-                print("Recording saved: \(outputPath)")
-                print("  Encoded: \(encoded) frames, Dropped: \(dropped) frames")
-
-                if let error = self.videoRecorder.lastError {
-                    print("  Warning: \(error.localizedDescription)")
+                    if let error = summary.lastError {
+                        print("  Warning: \(error.localizedDescription)")
+                    }
+                } else {
+                    print("Recording stop: no active recording was in progress")
                 }
 
                 DispatchQueue.main.async {

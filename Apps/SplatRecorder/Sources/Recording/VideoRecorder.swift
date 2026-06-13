@@ -15,12 +15,21 @@ struct RecordingFrame: @unchecked Sendable {
     let presentationTime: CMTime
 }
 
+/// Summary returned by stop() for stable post-stop reporting.
+struct RecordingSummary {
+    let outputURL: URL?
+    let encodedFrameCount: Int
+    let droppedFrameCount: Int
+    let lastError: VideoRecorderError?
+}
+
 /// Mutex-based video recorder using AVAssetWriter for H.264 MP4 output.
 /// Synchronous capture API — callable from @MainActor draw loop and GPU completion handlers.
 final class VideoRecorder: @unchecked Sendable {
 
     struct State {
         var isRecording = false
+        var isStopping = false
         var encodedFrameCount = 0
         var droppedFrameCount = 0
         var inflightFrameCount = 0
@@ -69,6 +78,7 @@ final class VideoRecorder: @unchecked Sendable {
             s.encodedFrameCount = 0
             s.droppedFrameCount = 0
             s.inflightFrameCount = 0
+            s.isStopping = false
             s.lastError = nil
 
             // Remove existing file if any
@@ -138,10 +148,11 @@ final class VideoRecorder: @unchecked Sendable {
     // MARK: - Per-Frame Capture
 
     /// Create a pixel-buffer-backed Metal texture for the current frame.
-    /// Handles fps throttling internally. Returns nil if the frame should be skipped.
+    /// Handles fps throttling internally. Returns nil if the frame should be skipped
+    /// or if recording is stopping.
     func makeFrameTexture(hostTime: CMTime) -> RecordingFrame? {
         state.withLock { s in
-            guard s.isRecording else { return nil }
+            guard s.isRecording, !s.isStopping else { return nil }
 
             // Frame rate throttling (with epsilon for CMTime precision)
             if s.lastFrameHostTime.isValid {
@@ -193,15 +204,16 @@ final class VideoRecorder: @unchecked Sendable {
     }
 
     /// Submit a captured frame for encoding. Safe to call from any thread.
+    /// After stop() sets isStopping, this still allows already-captured tail frames
+    /// to be appended as long as the writer/adaptor are still alive.
     func finishFrame(_ frame: RecordingFrame) {
         // Extract adaptor ref under lock, then call append outside lock
         // to avoid task-isolation conflict with @MainActor-isolated API.
         let adaptor: AVAssetWriterInputPixelBufferAdaptor?
         adaptor = state.withLock { s -> AVAssetWriterInputPixelBufferAdaptor? in
-            defer { s.inflightFrameCount -= 1 }
-            guard s.isRecording else { return nil }
             guard let inp = s.assetWriterInput, inp.isReadyForMoreMediaData else {
                 s.droppedFrameCount += 1
+                s.inflightFrameCount -= 1
                 return nil
             }
             return s.pixelBufferAdaptor
@@ -216,16 +228,44 @@ final class VideoRecorder: @unchecked Sendable {
             } else {
                 s.droppedFrameCount += 1
             }
+            s.inflightFrameCount -= 1
         }
+    }
+
+    /// Release an inflight frame that was never rendered or whose render failed.
+    /// Must be called for every RecordingFrame that was created but won't be
+    /// submitted via finishFrame, to avoid stop() hanging waiting for inflight count.
+    func discardFrame(_ frame: RecordingFrame) {
+        state.withLock { s in
+            s.droppedFrameCount += 1
+            s.inflightFrameCount -= 1
+        }
+        // frame (and its retained resources) released when out of scope
+        _ = frame
     }
 
     // MARK: - Stop / Cancel
 
     /// Stop recording and finalize the MP4. Blocks until all inflight frames
     /// are drained and the writer finishes.
-    func stop() throws {
-        // 1. Mark stopped — prevents new frames
-        state.withLock { $0.isRecording = false }
+    ///
+    /// - Returns: A `RecordingSummary` with stable post-stop stats, or `nil`
+    ///   if there was no active recording to stop (idle/idempotent).
+    func stop() throws -> RecordingSummary? {
+        // Check if there's an active writer to stop
+        let hasWriter: Bool = state.withLock { s in
+            s.assetWriter != nil && s.isRecording
+        }
+        guard hasWriter else {
+            // Idle or already stopped — return nil immediately
+            return nil
+        }
+
+        // 1. Mark stopping — prevents new frames from being created
+        state.withLock { s in
+            s.isStopping = true
+            s.isRecording = false
+        }
 
         // 2. Drain inflight frames (with 5s timeout)
         let deadline = DispatchTime.now() + .seconds(5)
@@ -248,16 +288,31 @@ final class VideoRecorder: @unchecked Sendable {
         }
         semaphore.wait()
 
+        // 4. Build summary BEFORE teardown clears state
+        let summary = state.withLock { s in
+            RecordingSummary(
+                outputURL: s.outputURL,
+                encodedFrameCount: s.encodedFrameCount,
+                droppedFrameCount: s.droppedFrameCount,
+                lastError: s.lastError
+            )
+        }
+
         teardown()
 
         if let error = writer?.error {
             throw VideoRecorderError.finishWritingFailed(error)
         }
+
+        return summary
     }
 
     /// Cancel recording, discarding the output file.
     func cancel() {
-        state.withLock { $0.isRecording = false }
+        state.withLock { s in
+            s.isRecording = false
+            s.isStopping = true
+        }
         // Don't wait for inflight frames — we're throwing away the output.
 
         if let url = state.withLock({ $0.outputURL }) {
@@ -279,6 +334,7 @@ final class VideoRecorder: @unchecked Sendable {
             s.outputURL = nil
             s.lastFrameHostTime = .invalid
             s.startHostTime = .invalid
+            s.isStopping = false
         }
     }
 }
